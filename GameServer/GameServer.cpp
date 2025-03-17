@@ -1,20 +1,105 @@
-﻿
-#include "pch.h"
-#include <iostream>
-#include "CorePch.h"
+﻿#include "pch.h"
+#include "ThreadManager.h"
+#include "Service.h"
+#include "Session.h"
+#include "GameSession.h"
+#include "GameSessionManager.h"
+#include "BufferWriter.h"
+#include "ClientPacketHandler.h"
+#include <tchar.h>
+#include "Protocol.pb.h"
+#include "Job.h"
+#include "Room.h"
+#include "Player.h"
+#include "DBConnectionPool.h"
+#include "DBBind.h"
+#include "XmlParser.h"
+#include "DBSynchronizer.h"
+#include "GenProcedures.h"
+
+enum
+{
+	WORKER_TICK = 64
+};
+
+void DoWorkerJob(ServerServiceRef& service)
+{
+	while (true)
+	{
+		LEndTickCount = ::GetTickCount64() + WORKER_TICK;
+
+		// 네트워크 입출력 처리 -> 인게임 로직까지 (패킷 핸들러에 의해)
+		service->GetIocpCore()->Dispatch(10);
+
+		// 예약된 일감 처리
+		ThreadManager::DistributeReservedJobs();
+
+		// 글로벌 큐
+		ThreadManager::DoGlobalQueueWork();
+	}
+}
 
 int main()
 {
-    std::cout << "Hello World!\n";
+	ASSERT_CRASH(GDBConnectionPool->Connect(1, L"Driver={SQL Server Native Client 11.0};Server=(localdb)\\MSSQLLocalDB;Database=ServerDb;Trusted_Connection=Yes;"));
+
+	DBConnection* dbConn = GDBConnectionPool->Pop();
+	DBSynchronizer dbSync(*dbConn);
+	dbSync.Synchronize(L"GameDB.xml");
+
+	{
+		WCHAR name[] = L"Rookiss";
+
+		SP::InsertGold insertGold(*dbConn);
+		insertGold.In_Gold(100);
+		insertGold.In_Name(name);
+		insertGold.In_CreateDate(TIMESTAMP_STRUCT{ 2020, 6, 8 });
+		insertGold.Execute();
+	}
+
+	{
+		SP::GetGold getGold(*dbConn);
+		getGold.In_Gold(100);
+
+		int32 id = 0;
+		int32 gold = 0;
+		WCHAR name[100];
+		TIMESTAMP_STRUCT date;
+
+		getGold.Out_Id(OUT id);
+		getGold.Out_Gold(OUT gold);
+		getGold.Out_Name(OUT name);
+		getGold.Out_CreateDate(OUT date);
+
+		getGold.Execute();
+
+		while (getGold.Fetch())
+		{
+			GConsoleLogger->WriteStdOut(Color::BLUE,
+				L"ID[%d] Gold[%d] Name[%s]\n", id, gold, name);
+		}
+	}
+
+	ClientPacketHandler::Init();
+
+	ServerServiceRef service = MakeShared<ServerService>(
+		NetAddress(L"127.0.0.1", 7777),
+		MakeShared<IocpCore>(),
+		MakeShared<GameSession>, // TODO : SessionManager 등
+		100);
+
+	ASSERT_CRASH(service->Start());
+
+	for (int32 i = 0; i < 5; i++)
+	{
+		GThreadManager->Launch([&service]()
+			{
+				DoWorkerJob(service);
+			});
+	}
+
+	// Main Thread
+	DoWorkerJob(service);
+
+	GThreadManager->Join();
 }
-
-// 프로그램 실행: <Ctrl+F5> 또는 [디버그] > [디버깅하지 않고 시작] 메뉴
-// 프로그램 디버그: <F5> 키 또는 [디버그] > [디버깅 시작] 메뉴
-
-// 시작을 위한 팁: 
-//   1. [솔루션 탐색기] 창을 사용하여 파일을 추가/관리합니다.
-//   2. [팀 탐색기] 창을 사용하여 소스 제어에 연결합니다.
-//   3. [출력] 창을 사용하여 빌드 출력 및 기타 메시지를 확인합니다.
-//   4. [오류 목록] 창을 사용하여 오류를 봅니다.
-//   5. [프로젝트] > [새 항목 추가]로 이동하여 새 코드 파일을 만들거나, [프로젝트] > [기존 항목 추가]로 이동하여 기존 코드 파일을 프로젝트에 추가합니다.
-//   6. 나중에 이 프로젝트를 다시 열려면 [파일] > [열기] > [프로젝트]로 이동하고 .sln 파일을 선택합니다.
